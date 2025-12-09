@@ -133,119 +133,107 @@ def extract_contract_note_trade(pdf_text):
     trade_data = {}
     trade_data['Source'] = 'contract_note'
 
-    # --- Fall 1: Scalable Contract note (neues Format) ---
+    # --- Scalable Contract note ---
+    # z.B.:
+    # "Contract note 
+    #  Sell 72.00 pc. Microsoft Call 478,00 BNP"
     if 'Contract note' in pdf_text:
-        # Zeile nach "Type Security Quantity Price Amount"
-        sec_line_match = re.search(
-            r'Type Security Quantity Price Amount\s*\n([^\n]+)',
-            pdf_text
-        )
-        if not sec_line_match:
-            print("Could not find security line in Scalable contract note.")
+        header_match = re.search(r'(Buy|Sell)\s+([\d\.,]+)\s*pc\.\s+(.+)', pdf_text)
+        if not header_match:
+            print("Could not find Buy/Sell header line in Scalable contract note.")
             return None
 
-        first_line = sec_line_match.group(1).strip()
-        parts = first_line.split(maxsplit=1)
-        if len(parts) < 2:
-            print("Unexpected security line format:", first_line)
-            return None
-
-        trade_word, asset_name = parts[0], parts[1]
+        trade_word, qty_str, asset_name = header_match.groups()
         trade_data['Trade Type'] = 'Buy' if trade_word.lower().startswith('buy') else 'Sell'
         trade_data['Asset Name'] = asset_name.strip()
+        trade_data['Quantity'] = parse_number(qty_str)
 
-        # Datum: "Execution 08.12.2025 15:31:57"
-        date_match = re.search(r'Execution\s+(\d{2}\.\d{2}\.\d{4})', pdf_text)
+        # Datum: erste dd.mm.yyyy im Dokument
+        date_match = re.search(r'(\d{2}\.\d{2}\.\d{4})', pdf_text)
         if date_match:
-            trade_data['Date'] = date_match.group(1).strip()
+            trade_data['Date'] = date_match.group(1)
 
-        # Menge & Preis: Zeile mit "72.00 pc. 1.74 EUR ..."
-        qp_match = re.search(r'\n([\d\.,]+)\s*pc\.?\s*([\d\.,]+)\s*EUR', pdf_text)
+        # Preis pro Stück aus "72.00 pc. 1.74 EUR"
+        qp_match = re.search(r'([\d\.,]+)\s*pc\.\s*([\d\.,]+)\s*EUR', pdf_text)
         if qp_match:
             qty = parse_number(qp_match.group(1))
             price = parse_number(qp_match.group(2))
             trade_data['Quantity'] = qty
             trade_data['Price per Unit'] = price
 
-        # Steuern von Seite 2
-        cg_match = re.search(r'Capital gains tax\s+([\d\.,]+)\s*EUR', pdf_text)
-        soli_match = re.search(r'Solidarity surcharge\s+([\d\.,]+)\s*EUR', pdf_text)
-        church_match = re.search(r'Church tax\s+([\d\.,]+)\s*EUR', pdf_text)
-
-        if cg_match and soli_match and church_match:
-            cg = parse_number(cg_match.group(1))
-            soli = parse_number(soli_match.group(1))
-            church = parse_number(church_match.group(1))
+        # Steuern: letzte 4 EUR-Beträge sind (Cap, Soli, Church, Total)
+        eur_values = re.findall(r'([\d\.,]+)\s*EUR', pdf_text)
+        if len(eur_values) >= 4:
+            tax_vals = eur_values[-4:-1]  # 1.10, 0.06, 0.10 in deinem Beispiel
+            cg = parse_number(tax_vals[0])
+            soli = parse_number(tax_vals[1])
+            church = parse_number(tax_vals[2])
             trade_data['Capital Gains Tax'] = cg
             trade_data['Solidarity Surcharge'] = soli
             trade_data['Church Tax'] = church
             trade_data['Taxes Sum'] = cg + soli + church
 
-        # Order Fees (falls du sie später in J eintragen willst)
-        fee_match = re.search(r'Order fees\s+(-?[\d\.,]+)\s*EUR', pdf_text)
-        if fee_match:
-            fee = abs(parse_number(fee_match.group(1)))
-            trade_data['Order Fee'] = fee
-
         return trade_data
 
-    # --- Fall 2: Baader / WPABRECHNUNG-060.114 ---
+    # --- Baader / WPABRECHNUNG-060.114 ---
     if 'Transaction Statement: Sale' in pdf_text or 'Transaction Statement: Purchase' in pdf_text:
         if 'Transaction Statement: Sale' in pdf_text:
             trade_data['Trade Type'] = 'Sell'
         else:
             trade_data['Trade Type'] = 'Buy'
 
-                # Asset-Name:
-        #   Units 26 UniCredit Bank GmbH
-        #   HVB Put 17.12.25 NVIDIA 200
-        #   Account Owner
-        asset_match = re.search(
-            r'Units\s+[\d\.,]+\s+.*\n([^\n]+)\nAccount Owner',
+        # Asset-Name: Block zwischen WKN: ... und "Order placed by:"
+        asset_block_match = re.search(
+            r'WKN:[^\n]*\n(.*?)\nOrder placed by:',
+            pdf_text,
+            re.S
+        )
+        if asset_block_match:
+            block = asset_block_match.group(1)
+            lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+            if not lines:
+                print("Baader asset block empty.")
+                return None
+            asset_name = lines[-1]
+            trade_data['Asset Name'] = asset_name
+            print(f"[DEBUG] Baader Asset Name: {asset_name}")
+        else:
+            print("Asset name not found in Baader contract note (block regex).")
+            return None
+
+        # (optional) Menge aus "Quantity\n\nUnits   26"
+        qty_match = re.search(r'Quantity\s*\n\s*Units\s+([\d\.,]+)', pdf_text)
+        if qty_match:
+            trade_data['Quantity'] = parse_number(qty_match.group(1))
+
+        # Datum: erstes ISO-Datum direkt nach "Transaction Statement: ..."
+        date_match = re.search(
+            r'Transaction Statement: (?:Sale|Purchase)\s*\n\s*(\d{4}-\d{2}-\d{2})',
             pdf_text
         )
-        if asset_match:
-            trade_data['Asset Name'] = asset_match.group(1).strip()
-            print(f"[DEBUG] Baader Asset Name: {trade_data['Asset Name']}")
-        else:
-            print("Asset name not found in Baader contract note.")
-            return None
-        
-        # Datum aus "Order Time:\n2025-11-13\n18:04:24:00"
-        date_match = re.search(r'Order Time:\s*[\r\n]+(\d{4}-\d{2}-\d{2})', pdf_text)
         if date_match:
             iso_date = date_match.group(1)
-            # in dd.mm.yyyy umwandeln
             dt = datetime.strptime(iso_date, "%Y-%m-%d")
             trade_data['Date'] = dt.strftime("%d.%m.%Y")
 
-        # Menge & Preis aus Details:
-        # Details:
-        # Units 26 EUR 1.69 GETTEX ...
-        details_match = re.search(
-            r'Details:\s*[\r\n]+Units\s+([\d\.,]+)\s+EUR\s+([\d\.,]+)',
-            pdf_text
+        # Steuern aus "Taxes paid / Tax Funds"-Bereich (Seite 2)
+        section_match = re.search(
+            r'Taxes paid / Tax Funds(.*?)Purchases taken into account',
+            pdf_text,
+            re.S
         )
-        if details_match:
-            qty = parse_number(details_match.group(1))
-            price = parse_number(details_match.group(2))
-            trade_data['Quantity'] = qty
-            trade_data['Price per Unit'] = price
-
-        # Steuern:
-        # German flat rate tax EUR 1.84 - Church tax EUR 0.16 - Solidarity surcharge EUR 0.10
-        taxes_match = re.search(
-            r'German flat rate tax\s*EUR\s*([\d\.,]+)\s*-\s*Church tax\s*EUR\s*([\d\.,]+)\s*-\s*Solidarity surcharge\s*EUR\s*([\d\.,]+)',
-            pdf_text
-        )
-        if taxes_match:
-            cg = parse_number(taxes_match.group(1))
-            church = parse_number(taxes_match.group(2))
-            soli = parse_number(taxes_match.group(3))
-            trade_data['Capital Gains Tax'] = cg
-            trade_data['Church Tax'] = church
-            trade_data['Solidarity Surcharge'] = soli
-            trade_data['Taxes Sum'] = cg + church + soli
+        if section_match:
+            section_text = section_match.group(1)
+            minus_vals = re.findall(r'([\d\.,]+)\s*-\s*', section_text)
+            if len(minus_vals) >= 3:
+                # letzte 3 negativen Werte: 1.84 -, 0.16 -, 0.10 -
+                cg = parse_number(minus_vals[-3])
+                church = parse_number(minus_vals[-2])
+                soli = parse_number(minus_vals[-1])
+                trade_data['Capital Gains Tax'] = cg
+                trade_data['Church Tax'] = church
+                trade_data['Solidarity Surcharge'] = soli
+                trade_data['Taxes Sum'] = cg + church + soli
 
         return trade_data
 
@@ -356,9 +344,6 @@ def update_excel(trade_data):
         # if 'Order Fee' in trade_data:
         #     old_fee = sheet[f'J{match_row}'].value or 0
         #     sheet[f'J{match_row}'] = old_fee + trade_data['Order Fee']
-
-        else:
-            print(f"No matching Buy entry found for asset {asset_name}.")
             # Optionally, handle this case by logging or adding an error row
 
     workbook.save(EXCEL_FILE)
