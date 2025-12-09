@@ -7,439 +7,444 @@ from openpyxl.utils import get_column_letter
 from openpyxl.styles import NamedStyle
 from datetime import datetime
 
-# Define paths
-PDF_FOLDER = os.path.join(os.path.dirname(__file__), 'pdfs')
-EXCEL_FILE = os.path.join(os.path.dirname(__file__), 'Trading.xlsx')
+# --- KONFIGURATION ---
+# Pfad zum Ordner, in dem das Skript liegt
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PDF_FOLDER = os.path.join(BASE_DIR, 'pdfs')
+EXCEL_FILE = os.path.join(BASE_DIR, 'Trading.xlsx')
+
+# ---------------------------------------------------------
+# HILFSFUNKTIONEN
+# ---------------------------------------------------------
+
+def parse_german_float(text):
+    """Wandelt deutsche (1.234,56) oder englische Zahlen in float um."""
+    if not text:
+        return 0.0
+    # Bereinigen
+    text = text.replace('EUR', '').replace('USD', '').replace('€', '').replace('$', '').strip()
+    
+    # Fall: 1.234,56 (Deutsch) -> Punkt entfernen, Komma zu Punkt
+    if ',' in text and '.' in text:
+        if text.find('.') < text.find(','):
+            text = text.replace('.', '').replace(',', '.')
+        else:
+            text = text.replace(',', '') # Englisch (1,200.50)
+    elif ',' in text:
+        text = text.replace(',', '.')
+    
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+def are_assets_similar(name1, name2):
+    """Vergleicht zwei Asset-Namen tolerant (Intelligentes Matching)."""
+    if not name1 or not name2:
+        return False
+    
+    s1 = str(name1).lower()
+    s2 = str(name2).lower()
+    
+    if s1 == s2: return True
+
+    def clean_and_tokenize(text):
+        text = re.sub(r'\d{2}\.\d{2}\.\d{2,4}', '', text) # Datum weg
+        text = re.sub(r'[\$€]', '', text)
+        text = text.replace('eur', '').replace('usd', '').replace('pc.', '').replace('stk.', '')
+        text = text.replace(',', '.')
+        tokens = text.split()
+        cleaned = set()
+        for t in tokens:
+            try:
+                # Zahlen normalisieren (200.00 -> 200)
+                val = float(t)
+                t = f"{val:.4f}".rstrip('0').rstrip('.')
+            except ValueError:
+                pass
+            if len(t) > 1 or t.isdigit():
+                cleaned.add(t)
+        return cleaned
+
+    tokens1 = clean_and_tokenize(s1)
+    tokens2 = clean_and_tokenize(s2)
+    
+    common = tokens1.intersection(tokens2)
+    min_len = min(len(tokens1), len(tokens2))
+    if min_len == 0: return False
+    
+    # Erlaube 1 abweichendes Wort bei längeren Namen
+    threshold = min_len if min_len < 3 else min_len - 1
+    
+    return len(common) >= threshold
+
+# ---------------------------------------------------------
+# PARSER FUNKTIONEN (PDFs)
+# ---------------------------------------------------------
 
 def extract_trade_info_transaction_statement(pdf_text: str):
-    """Parser für Baader/Scalable 'Transaction Statement: Sale/Purchase'-PDFs."""
-    trade_data = {"Source": "transaction_statement"}
-
-    # 1) Trade-Typ UND Datum direkt aus dem Kopf:
-    #    "Transaction Statement: Sale\n2025-11-13\n18:04:24:00\n..."
-    m_head = re.search(
-        r'Transaction Statement:\s*(Sale|Purchase|Buy)\s+(\d{4}-\d{2}-\d{2})',
-        pdf_text,
-        re.IGNORECASE
-    )
-    if not m_head:
-        print("Could not find transaction header in transaction statement PDF.")
-        return None
-
-    word, date_iso = m_head.groups()
-    word = word.lower()
-    trade_data["Trade Type"] = "Sell" if word == "sale" else "Buy"
-
-    try:
-        year, month, day = date_iso.split("-")
-        trade_data["Date"] = f"{day}.{month}.{year}"
-    except Exception:
-        print(f"Could not convert header date '{date_iso}' in transaction statement PDF.")
-        return None
-
-    # 2) Block um "Quantity" herum heraus schneiden (Quantity + Asset)
-    start = pdf_text.find("Quantity")
-    if start == -1:
-        print("Could not find 'Quantity' block in transaction statement PDF.")
-        return None
-
-    end_candidates = []
-    for marker in ["Account Owner", "Market Value", "Value:", "Custody Account"]:
-        idx = pdf_text.find(marker, start)
-        if idx != -1:
-            end_candidates.append(idx)
-
-    end = min(end_candidates) if end_candidates else (start + 400)
-    block_text = pdf_text[start:end]
-    block_lines = block_text.splitlines()
-
-    # 2a) Stückzahl aus einer Zeile mit "Units <Zahl>"
-    quantity = None
-    for line in block_lines:
-        m = re.search(r'Units\s+([\d\.,]+)', line)
-        if m:
-            try:
-                quantity = float(m.group(1).replace(",", "."))
-                break
-            except ValueError:
-                continue
-
-    if quantity is None:
-        print("Could not parse quantity from transaction statement PDF.")
-        return None
-
-    trade_data["Quantity"] = quantity
-
-    # 2b) Asset-Name:
-    #     Wir sammeln alle Zeilen im Quantity-Block, die keine Metadaten sind,
-    #     und nehmen die letzte sinnvolle Zeile ohne ":" (z.B. "HVB Put 17.12.25 NVIDIA 200")
-    candidates = []
-    for line in block_lines:
-        s = line.strip()
-        if not s:
-            continue
-        if s.startswith("Quantity") or s.startswith("Units"):
-            continue
-        candidates.append(s)
-
-    # zuerst alle ohne ":", falls vorhanden
-    no_colon = [s for s in candidates if ":" not in s]
-    if no_colon:
-        asset_name = no_colon[-1]
+    """
+    Parser für ALTE Baader/Scalable 'Transaction Statement'.
+    Hier stehen Steuern oft detailliert (Kapitalertragsteuer etc.).
+    """
+    data = {"Source": "transaction_statement", "Taxes": 0.0, "Fee": 0.0}
+    
+    # Typ (Sale/Purchase)
+    if re.search(r'Transaction Statement:\s*Sale', pdf_text, re.IGNORECASE):
+        data["Trade Type"] = "Sell"
+    elif re.search(r'Transaction Statement:\s*(Purchase|Buy)', pdf_text, re.IGNORECASE):
+        data["Trade Type"] = "Buy"
     else:
-        asset_name = candidates[-1] if candidates else None
-
-    trade_data["Asset Name"] = asset_name
-
-    # 3) Preis pro Einheit:
-    #    Wir suchen nach einem "Price"-Label und nehmen die erste Zeile danach,
-    #    die wie eine Zahl aussieht (z.B. "1.69")
-    lines = pdf_text.splitlines()
-    price = None
-    for i, line in enumerate(lines):
-        if line.strip().startswith("Price"):
-            for j in range(i + 1, min(i + 10, len(lines))):
-                s = lines[j].strip()
-                if re.match(r'^-?\d+[.,]\d+$', s):  # einfache Dezimalzahl
-                    try:
-                        price = float(s.replace(",", "."))
-                        break
-                    except ValueError:
-                        continue
-            if price is not None:
-                break
-
-    if price is None:
-        print("Could not find price in transaction statement PDF (Price block).")
         return None
 
-    trade_data["Price per Unit"] = price
-
-    # 4) Steuern:
-    #    Im Statement gibt es einen Block wie:
-    #    43.94
-    #    1.84 -
-    #    0.16 -
-    #    0.10 -
-    #    41.84
-    #    Wir nehmen die erste Gruppe von Zeilen mit "Zahl -"
-    taxes = 0.0
-    tax_start = None
-    for idx, line in enumerate(lines):
-        if re.search(r'([0-9]+[.,][0-9]+)\s*-', line):
-            tax_start = idx
-            break
-
-    if tax_start is not None:
-        for j in range(tax_start, min(tax_start + 10, len(lines))):
-            m = re.search(r'([0-9]+[.,][0-9]+)\s*-', lines[j])
-            if m:
-                try:
-                    val = float(m.group(1).replace(",", "."))
-                    taxes += abs(val)
-                except ValueError:
-                    continue
-
-    trade_data["Taxes"] = taxes
-
-    return trade_data
-
-def extract_trade_info_cost_information(pdf_text: str):
-    """Parser für Ex-Ante cost information PDFs."""
-    trade_data = {"Source": "cost_information"}
-
-    # Trade Type
-    if re.search(r'\bOrder\s+Buy\b', pdf_text, re.IGNORECASE) or re.search(r'\bBuy\b', pdf_text, re.IGNORECASE):
-        trade_data['Trade Type'] = 'Buy'
-    elif re.search(r'\bOrder\s+Sell\b', pdf_text, re.IGNORECASE) or re.search(r'\bSell\b', pdf_text, re.IGNORECASE):
-        trade_data['Trade Type'] = 'Sell'
-    else:
-        print("Trade type not found in cost information PDF.")
-        return None
-
-    # Asset Name: Zeile nach "Ex-Ante cost information"
-    asset_match = re.search(r'Ex-Ante cost information\s*\n\s*(.+)', pdf_text, re.IGNORECASE)
-    if asset_match:
-        trade_data['Asset Name'] = asset_match.group(1).strip()
-    else:
-        print("Asset Name not found in cost information PDF.")
-        return None
-
-    # Datum – bevorzugt "Date 08.12.2025", sonst Fallback auf dein altes Muster
-    date_match = re.search(r'Date\s+(\d{2}\.\d{2}\.\d{4})', pdf_text)
-    if not date_match:
-        date_match = re.search(r'Date\s*(?:\n.*?){3}\n\s*(\d{2}\.\d{2}\.\d{4})', pdf_text)
+    # Datum
+    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', pdf_text)
     if date_match:
-        trade_data['Date'] = date_match.group(1).strip()
+        y, m, d = date_match.group(1).split('-')
+        data["Date"] = f"{d}.{m}.{y}"
     else:
-        print("Date not found in cost information PDF.")
         return None
 
-    # Stückzahl – "Quantity 100 Shr."
-    quantity_match = re.search(r'Quantity\s+([\d\.,]+)\s*Shr\.', pdf_text)
-    if not quantity_match:
-        quantity_match = re.search(r'([\d\.,]+)\s*Shr\.', pdf_text)
-    if quantity_match:
-        quantity = float(quantity_match.group(1).replace(',', '.'))
-        trade_data['Quantity'] = quantity
+    # Menge
+    units_match = re.search(r'Units\s+([\d\.,]+)', pdf_text)
+    if units_match:
+        data["Quantity"] = parse_german_float(units_match.group(1))
     else:
-        print("Quantity not found in cost information PDF.")
         return None
 
-    # Preis pro Stück: Zeile nach "Shr." enthält die geschätzte Order-Summe (z.B. 119.00 €):contentReference[oaicite:0]{index=0}
-    price_match = re.search(r'Shr\.\s*\n\s*([\d\.,]+)\s*€', pdf_text)
+    # Asset Name (Heuristiken wie im alten Code)
+    lines = pdf_text.splitlines()
+    asset_name = None
+    start_idx = -1
+    
+    # Anker suchen (Price EUR oder ISIN)
+    for i, line in enumerate(lines):
+        if "Price" in line and "EUR" in line:
+            start_idx = i
+            break
+    if start_idx == -1:
+        for i, line in enumerate(lines):
+            if "ISIN:" in line:
+                start_idx = i
+                break
+
+    if start_idx != -1:
+        for i in range(start_idx + 1, min(len(lines), start_idx + 10)):
+            line = lines[i].strip()
+            if not line: continue
+            bad_words = ["Execution Venue", "Market Value", "Amount", "Order", "Account", "Baader", "Client", "Portfolio"]
+            if any(bw.lower() in line.lower() for bw in bad_words): continue
+            if re.match(r'^[\d\.,\s:-]+$', line): continue 
+            if re.search(r'\d{4}-\d{2}-\d{2}', line): continue
+            if "Price" in line and "EUR" in line: continue
+            
+            asset_name = line
+            break
+            
+    if not asset_name:
+        # Fallback: Suche im Quantity Block
+        q_idx = pdf_text.find("Quantity")
+        if q_idx != -1:
+            snippet = pdf_text[q_idx:q_idx+400]
+            for line in snippet.splitlines():
+                if "Execution Venue" in line: continue
+                if len(line) > 3 and not any(x in line for x in ["Quantity", "Units", "Price", "2025-", "Date"]):
+                     asset_name = line.strip()
+                     break
+
+    data["Asset Name"] = asset_name if asset_name else "Unknown Asset"
+
+    # Preis
+    price_match = re.search(r'Price\s+EUR\s+([\d\.,]+)', pdf_text)
     if price_match:
-        total_order_amount = float(price_match.group(1).replace(',', '.'))
-        trade_data['Price per Unit'] = total_order_amount / quantity
+        data["Price per Unit"] = parse_german_float(price_match.group(1))
     else:
-        print("Price / Est. order amount not found in cost information PDF.")
         return None
 
-    # In Cost-Info PDFs keine Steuer -> 0
-    trade_data['Taxes'] = 0.0
-
-    return trade_data
-
+    # Steuern (Summieren)
+    taxes = 0.0
+    tax_keywords = ["German flat rate tax", "Solidarity surcharge", "Church tax", "Kapitalertragsteuer", "Soli"]
+    for line in lines:
+        for key in tax_keywords:
+            if key in line:
+                # Suche Zahl am Ende der Zeile oder nach EUR
+                m = re.search(r'([\d\.,]+)\s*-?$', line.strip())
+                if not m: m = re.search(r'EUR\s+([\d\.,]+)', line)
+                if m: taxes += parse_german_float(m.group(1))
+    
+    data["Taxes"] = taxes
+    return data
 
 def extract_trade_info_contract_note(pdf_text: str):
-    """Parser für Contract-Note PDFs (mit Steuern)."""
-    trade_data = {"Source": "contract_note"}
+    """
+    Parser für NEUE Scalable 'Contract Note'.
+    Hier stehen Steuern oft als "Taxes" Block weiter unten.
+    """
+    data = {"Source": "contract_note", "Taxes": 0.0, "Fee": 0.0}
 
-    # Zeile beginnt mit "Buy ..." oder "Sell ..."
-    trade_line = re.search(r'^(Buy|Sell)\s+(.+)$', pdf_text, re.MULTILINE)
-    if not trade_line:
-        print("Trade line with Buy/Sell not found in contract note PDF.")
-        return None
-
-    trade_data['Trade Type'] = trade_line.group(1)
-    trade_data['Asset Name'] = trade_line.group(2).strip()
-
-    # Datum: zuerst "Execution 08.12.2025", ansonsten "Date 08.12.2025"
-    date_match = re.search(r'Execution\s+(\d{2}\.\d{2}\.\d{4})', pdf_text)
-    if not date_match:
-        date_match = re.search(r'Date\s+(\d{2}\.\d{2}\.\d{4})', pdf_text)
-    if date_match:
-        trade_data['Date'] = date_match.group(1).strip()
-    else:
-        print("Date not found in contract note PDF.")
-        return None
-
-    # Menge + Preis: "100.00 pc. 1.26 EUR 126.00 EUR"
-    qp_match = re.search(r'([\d\.,]+)\s*pc\.\s+([\d\.,]+)\s*EUR\s+([\d\.,]+)\s*EUR', pdf_text)
-    if qp_match:
-        quantity = float(qp_match.group(1).replace(',', '.'))
-        price_per_unit = float(qp_match.group(2).replace(',', '.'))
-        trade_data['Quantity'] = quantity
-        trade_data['Price per Unit'] = price_per_unit
-    else:
-        print("Quantity/Price line not found in contract note PDF.")
-        return None
-
-    # Gebühren (Order fees +/-0.99 EUR)
-    fee_match = re.search(r'Order fees\s*([+-]?[\d\.,]+)\s*EUR', pdf_text)
-    if fee_match:
-        fee_value = float(fee_match.group(1).replace(',', '.'))
-        trade_data['Order Fee'] = abs(fee_value)
-    else:
-        trade_data['Order Fee'] = 0.0
-
-    # Steuern – nur beim Sell: "Taxes -1.98 EUR":contentReference[oaicite:5]{index=5}
-    tax_match = re.search(r'Taxes\s*([+-]?[\d\.,]+)\s*EUR', pdf_text)
-    if tax_match:
-        tax_value = float(tax_match.group(1).replace(',', '.'))
-        trade_data['Taxes'] = abs(tax_value)
-    else:
-        trade_data['Taxes'] = 0.0
-
-    return trade_data
-
-
-def extract_trade_info(pdf_text: str):
-    """Router: entscheidet, welcher Parser genutzt wird."""
-    try:
-        if re.search(r'Contract note', pdf_text, re.IGNORECASE):
-            parser = extract_trade_info_contract_note
-        elif re.search(r'Transaction Statement:', pdf_text, re.IGNORECASE):
-            parser = extract_trade_info_transaction_statement
-        elif re.search(r'Ex-Ante cost information', pdf_text, re.IGNORECASE):
-            parser = extract_trade_info_cost_information
+    # Typ & Asset (Erste Zeile: "Sell ... Asset Name")
+    # Sucht nach Zeilenstart mit Buy/Sell gefolgt von Text
+    head_match = re.search(r'^(Buy|Sell)\s+(?:[\d\.,]+(?:\s*pc\.|\s*Stk\.)?)?\s*(.+)$', pdf_text, re.MULTILINE)
+    
+    if head_match:
+        data["Trade Type"] = head_match.group(1).capitalize()
+        # Manchmal ist die Menge im Namen drin, manchmal davor. Hier vereinfacht:
+        raw_name = head_match.group(2).strip()
+        # Falls die Menge noch am Anfang des Namens klebt (z.B. "72.00 pc. Microsoft")
+        name_cleanup = re.search(r'^[\d\.,]+\s*(?:pc\.|Stk\.)\s+(.+)', raw_name)
+        if name_cleanup:
+            data["Asset Name"] = name_cleanup.group(1).strip()
         else:
-            print("Unrecognized PDF type (neither contract note, transaction statement nor cost info).")
-            return None
-
-        trade_data = parser(pdf_text)
-        return trade_data
-
-    except Exception as e:
-        # Etwas hilfreichere Fehlermeldung, falls doch mal was crasht
-        print(f"Error while parsing PDF with {parser.__name__}: {e}")
-        snippet = pdf_text[:400].replace('\n', ' ')
-        print(f"PDF snippet (first 400 chars): {snippet} ...")
+            data["Asset Name"] = raw_name
+    else:
         return None
 
-def get_column_letter_for_header(sheet, header_name: str):
-    """Gibt den Spaltenbuchstaben zur Überschrift in Zeile 1 zurück."""
+    # Datum
+    date_match = re.search(r'(?:Execution|Date)\s+(\d{2}\.\d{2}\.\d{4})', pdf_text)
+    if date_match: 
+        data["Date"] = date_match.group(1)
+    else: 
+        return None
+
+    # Menge & Preis
+    # Pattern: "72.00 pc. 1.74 EUR"
+    qp_match = re.search(r'([\d\.,]+)\s*(?:pc\.|Stk\.)\s+([\d\.,]+)\s*EUR', pdf_text)
+    if qp_match:
+        data["Quantity"] = parse_german_float(qp_match.group(1))
+        data["Price per Unit"] = parse_german_float(qp_match.group(2))
+    else: 
+        return None
+
+    # Gebühren (Order fees)
+    # Sucht nach "Order fees" und dann einer Zahl, auch über Zeilenumbrüche hinweg
+    fee_match = re.search(r'Order fees\s*[\r\n]*\s*([-\d\.,]+)\s*EUR', pdf_text, re.MULTILINE)
+    if fee_match: 
+        data["Fee"] = abs(parse_german_float(fee_match.group(1)))
+
+    # Steuern (Taxes)
+    # Sucht nach "Taxes" gefolgt von Zahl, erlaubt Newlines/Whitespace
+    # Wichtig: Scalable schreibt oft negativ (-1.26 EUR), wir wollen positiv für Excel
+    tax_match = re.search(r'Taxes\s*[\r\n]*\s*([-\d\.,]+)\s*EUR', pdf_text, re.MULTILINE)
+    if tax_match: 
+        data["Taxes"] = abs(parse_german_float(tax_match.group(1)))
+
+    return data
+
+def extract_trade_info_cost_information(pdf_text: str):
+    """Parser für 'Ex-Ante cost information' (meist keine echten Steuern, nur Gebührenschätzung)."""
+    data = {"Source": "cost_information", "Taxes": 0.0, "Fee": 0.0}
+    
+    if "Order Buy" in pdf_text or "Order\nBuy" in pdf_text: data["Trade Type"] = "Buy"
+    elif "Order Sell" in pdf_text or "Order\nSell" in pdf_text: data["Trade Type"] = "Sell"
+    else: return None
+
+    asset_match = re.search(r'Ex-Ante cost information\s*\n\s*(.+)', pdf_text)
+    data["Asset Name"] = asset_match.group(1).strip() if asset_match else "Unknown"
+
+    date_match = re.search(r'Date\s+(\d{2}\.\d{2}\.\d{4})', pdf_text)
+    if date_match: data["Date"] = date_match.group(1)
+    else: return None
+
+    qty_match = re.search(r'Quantity\s+([\d\.,]+)', pdf_text)
+    if qty_match: data["Quantity"] = parse_german_float(qty_match.group(1))
+    else: return None
+
+    # Preis schätzen aus "Est. order amount"
+    amt_match = re.search(r'Est\. order amount\s+([\d\.,]+)\s*€', pdf_text)
+    if amt_match and data["Quantity"] > 0:
+        total = parse_german_float(amt_match.group(1))
+        data["Price per Unit"] = total / data["Quantity"]
+    else:
+        data["Price per Unit"] = 0.0
+        
+    # Service Charges als Fee annehmen
+    fee_match = re.search(r'Service charges\s+([\d\.,]+)\s*EUR', pdf_text)
+    if fee_match:
+        data["Fee"] = parse_german_float(fee_match.group(1))
+
+    return data
+
+def extract_trade_info(pdf_path):
+    try:
+        text = extract_text(pdf_path)
+    except Exception as e:
+        print(f"Fehler beim Lesen von {pdf_path}: {e}")
+        return None
+
+    if "Transaction Statement" in text:
+        return extract_trade_info_transaction_statement(text)
+    elif "Contract note" in text or "Abrechnung" in text:
+        return extract_trade_info_contract_note(text)
+    elif "Ex-Ante cost information" in text or "Kostentransparenz" in text:
+        return extract_trade_info_cost_information(text)
+    else:
+        print(f"Unbekanntes PDF Format: {os.path.basename(pdf_path)}")
+        return None
+
+# ---------------------------------------------------------
+# EXCEL HANDLING (NUR ROHDATEN SCHREIBEN)
+# ---------------------------------------------------------
+
+def ensure_columns_exist(sheet):
+    """
+    Liest die Header aus Zeile 1 und gibt ein Mapping {Name: Buchstabe} zurück.
+    Erstellt KEINE neuen Spalten mehr, um Layout nicht zu zerschießen.
+    """
+    headers = {}
     for cell in sheet[1]:
-        if cell.value == header_name:
-            try:
-                return cell.column_letter  # neuere openpyxl
-            except AttributeError:
-                return get_column_letter(cell.column)
+        if cell.value:
+            headers[str(cell.value).strip()] = cell.column_letter
+    return headers
+
+def find_buy_row(sheet, asset_name, quantity):
+    """Sucht die Kauf-Zeile."""
+    for row in range(2, sheet.max_row + 1):
+        name_cell = sheet[f"A{row}"]
+        sell_date_cell = sheet[f"F{row}"]
+        
+        # Nur Zeilen ohne Verkaufsdatum betrachten
+        if sell_date_cell.value:
+            continue
+            
+        excel_name = str(name_cell.value).strip() if name_cell.value else ""
+        
+        if are_assets_similar(excel_name, asset_name):
+            # Optional: Check Quantity match für mehr Sicherheit
+            # qty_cell = sheet[f"C{row}"]
+            # if qty_cell.value and abs(float(qty_cell.value) - quantity) < 0.001:
+            return row
+            
     return None
 
-
-def find_next_empty_row_in_column(sheet, column_letter):
-    """Find the next empty row in the specified column that has actual data."""
-    for row in range(1, sheet.max_row + 1):
-        if not sheet[f'{column_letter}{row}'].value:  # Check if the cell in column A is empty
-            return row
-    return sheet.max_row + 1  # If no empty row is found, return the next available row
-
-
-def apply_date_format_to_column(sheet, column_letter):
-    """Ensure the entire column has the same date format applied."""
-    date_style = NamedStyle(name="date_style", number_format="DD/MM/YYYY")
-    
-    # If the style already exists, don't recreate it
-    if "date_style" not in sheet.parent.named_styles:
-        sheet.parent.add_named_style(date_style)
-
-    for row in range(2, sheet.max_row + 1):  # Assuming row 1 is headers
-        if isinstance(sheet[f'{column_letter}{row}'].value, datetime):
-            sheet[f'{column_letter}{row}'].style = date_style
-
-
-def update_excel(trade_data):
-    # Read the existing Excel file or create a new DataFrame
-    if os.path.exists(EXCEL_FILE):
-        workbook = load_workbook(EXCEL_FILE)
-        sheet = workbook.active
-    else:
-        print("Excel not found")
+def write_excel(all_trades):
+    if not os.path.exists(EXCEL_FILE):
+        print(f"Excel-Datei nicht gefunden unter: {EXCEL_FILE}")
         return
 
-    trade_type = trade_data['Trade Type']
-    asset_name = trade_data['Asset Name']
+    wb = load_workbook(EXCEL_FILE)
+    ws = wb.active
+    header_map = ensure_columns_exist(ws)
+    
+    # Wichtige Spalten identifizieren
+    col_taxes = header_map.get("Taxes")
+    col_fee = header_map.get("Trading Fee")
+    
+    # Debug Info
+    if not col_taxes: print("ACHTUNG: Spalte 'Taxes' nicht gefunden. Steuern werden nicht eingetragen.")
+    if not col_fee: print("ACHTUNG: Spalte 'Trading Fee' nicht gefunden. Gebühren werden nicht eingetragen.")
 
-    # Ensure date format is applied correctly
-    date_style = NamedStyle(name="date_style", number_format="DD/MM/YYYY")
+    date_style = NamedStyle(name="date_style_final_v3", number_format="DD.MM.YYYY")
+    if "date_style_final_v3" not in wb.named_styles:
+        wb.add_named_style(date_style)
 
-    # Check if the date_style already exists to avoid the ValueError
-    if "date_style" not in workbook.named_styles:
-        workbook.add_named_style(date_style)
+    for trade in all_trades:
+        asset = trade["Asset Name"]
+        date_obj = datetime.strptime(trade["Date"], "%d.%m.%Y")
+        qty = trade["Quantity"]
+        price = trade["Price per Unit"]
+        taxes = trade.get("Taxes", 0.0)
+        fee = trade.get("Fee", 0.0)
 
-    # NEU: Spalte "Taxes" suchen (Header in Zeile 1 muss exakt so heißen)
-    taxes_col = get_column_letter_for_header(sheet, 'Taxes')
+        if trade["Trade Type"] == "Buy":
+            # Neue Zeile anhängen
+            row = ws.max_row + 1
+            if not ws[f"A{ws.max_row}"].value and ws.max_row > 1:
+                row = ws.max_row
+            
+            # NUR INPUTS SCHREIBEN (keine Formeln überschreiben in E, etc.)
+            ws[f"A{row}"] = asset
+            ws[f"B{row}"] = date_obj
+            ws[f"B{row}"].style = "date_style_final_v3"
+            ws[f"C{row}"] = qty
+            ws[f"D{row}"] = price
+            
+            # Wenn du Formeln hast (Spalte E), werden diese NICHT angefasst.
+            # Falls du eine "intelligente Tabelle" (ListObject) nutzt, füllt Excel E automatisch.
+            # Falls nicht, musst du die Formel manuell runterziehen.
+            print(f"BUY eingetragen: {asset} (Zeile {row})")
 
-    if trade_type == 'Buy':
-        next_row = find_next_empty_row_in_column(sheet, 'A')
+        elif trade["Trade Type"] == "Sell":
+            row = find_buy_row(ws, asset, qty)
+            if row:
+                # NUR INPUTS SCHREIBEN
+                ws[f"F{row}"] = date_obj
+                ws[f"F{row}"].style = "date_style_final_v3"
+                ws[f"G{row}"] = qty
+                ws[f"H{row}"] = price
+                
+                # Gebühren und Steuern eintragen, wo sie hingehören
+                if col_fee:
+                    ws[f"{col_fee}{row}"] = fee
+                
+                if col_taxes:
+                    ws[f"{col_taxes}{row}"] = taxes
 
-        sheet[f'A{next_row}'] = trade_data['Asset Name']
-        buy_date = trade_data['Date']
-        if isinstance(buy_date, str):
-            buy_date = datetime.strptime(buy_date, "%d.%m.%Y").date()
-        sheet[f'B{next_row}'] = buy_date
-        sheet[f'B{next_row}'].style = "date_style"
-        sheet[f'C{next_row}'] = trade_data['Quantity']
-        sheet[f'D{next_row}'] = trade_data['Price per Unit']
+                # KEINE Formeln schreiben (K, M, N werden ignoriert)
+                print(f"SELL gematched: '{asset}' in Zeile {row}. Tax: {taxes}, Fee: {fee}")
+            else:
+                print(f"WARNUNG: Kein Match für Sell '{asset}' gefunden.")
 
-        # Optional: Buy-Zeile mit 0 Steuern initialisieren
-        if taxes_col is not None:
-            sheet[f'{taxes_col}{next_row}'] = trade_data.get('Taxes', 0.0)
-
-    elif trade_type == 'Sell':
-        # Find the row that matches the Buy entry and doesn't have a Sell Date yet
-        for row in range(2, sheet.max_row + 1):  # Assuming row 1 is headers
-            if sheet[f'A{row}'].value == asset_name and not sheet[f'F{row}'].value:
-                sell_date = trade_data['Date']
-                if isinstance(sell_date, str):
-                    sell_date = datetime.strptime(sell_date, "%d.%m.%Y").date()
-                sheet[f'F{row}'] = sell_date
-                sheet[f'F{row}'].style = "date_style"
-                sheet[f'G{row}'] = trade_data['Quantity']
-                sheet[f'H{row}'] = trade_data['Price per Unit']
-
-                # NEU: Steuer in die "Taxes"-Spalte eintragen, falls vorhanden
-                if taxes_col is not None and 'Taxes' in trade_data:
-                    sheet[f'{taxes_col}{row}'] = trade_data['Taxes']
-                break
-        else:
-            print(f"No matching Buy entry found for asset {asset_name}.")
-
-    workbook.save(EXCEL_FILE)
-    print(f"Excel file updated successfully with trade data for {trade_data['Asset Name']}.")
+    try:
+        wb.save(EXCEL_FILE)
+        print("Excel Update abgeschlossen.")
+    except PermissionError:
+        print("FEHLER: Bitte Excel-Datei schließen!")
 
 def process_pdfs():
     if not os.path.exists(PDF_FOLDER):
-        print(f"PDF folder {PDF_FOLDER} not found")
+        os.makedirs(PDF_FOLDER)
         return
 
-    trades_by_key = {}
+    files = [f for f in os.listdir(PDF_FOLDER) if f.lower().endswith('.pdf')]
+    if not files:
+        print("Keine PDFs gefunden.")
+        return
 
-    for filename in os.listdir(PDF_FOLDER):
-        if not filename.lower().endswith('.pdf'):
-            continue
+    merged_trades = {}
 
-        pdf_path = os.path.join(PDF_FOLDER, filename)
-        print(f"Processing {filename}...")
+    for filename in files:
+        path = os.path.join(PDF_FOLDER, filename)
+        # print(f"Lese {filename}...")
+        trade_data = extract_trade_info(path)
+        
+        if trade_data:
+            trade_data['_filename'] = filename
+            # Merging Logik (z.B. Cost Info vs Contract Note)
+            key = (trade_data['Date'], trade_data['Trade Type'], trade_data['Quantity'])
+            
+            if key in merged_trades:
+                existing = merged_trades[key]
+                # Contract Note gewinnt immer (weil genauer)
+                if trade_data['Source'] == 'contract_note':
+                    merged_trades[key] = trade_data
+                elif existing['Source'] == 'contract_note':
+                    pass
+                # Transaction Statement ist auch besser als Cost Info
+                elif trade_data['Source'] == 'transaction_statement' and existing['Source'] == 'cost_information':
+                    merged_trades[key] = trade_data
+            else:
+                merged_trades[key] = trade_data
+            
+            try: os.remove(path) 
+            except: pass
 
+    final_list = list(merged_trades.values())
+    
+    # Sortierung: Erst Käufe, dann Verkäufe
+    def sort_algo(t):
         try:
-            pdf_text = extract_text(pdf_path)
-        except Exception as e:
-            print(f"Failed to read {filename}: {e}")
-            continue
+            d, m, y = t['Date'].split('.')
+            type_prio = 0 if t['Trade Type'] == 'Buy' else 1
+            return (int(y)*10000 + int(m)*100 + int(d), type_prio)
+        except:
+            return (0, 0)
 
-        trade_data = extract_trade_info(pdf_text)
-        if not trade_data:
-            print(f"Failed to extract data from {filename}.")
-            continue
-
-        # Für Debugging ggf. hilfreich
-        trade_data['_filename'] = filename
-
-        # Schlüssel, um denselben Trade wiederzuerkennen
-        key = (
-            trade_data['Trade Type'],
-            trade_data['Asset Name'],
-            trade_data['Date'],
-            trade_data['Quantity'],
-        )
-
-        existing = trades_by_key.get(key)
-        if existing is None:
-            trades_by_key[key] = trade_data
-        else:
-            # Wenn Cost-Info UND Contract-Note existieren:
-            # Contract-Note bevorzugen (weil exakte Gebühren/Steuern)
-            if trade_data.get('Source') == 'contract_note' and existing.get('Source') != 'contract_note':
-                trades_by_key[key] = trade_data
-
-        # PDF nach erfolgreichem Einlesen löschen (wie bisher)
-        try:
-            os.remove(pdf_path)
-            print(f"{filename} processed and deleted.")
-        except OSError as e:
-            print(f"Could not delete {filename}: {e}")
-
-    # Jetzt alle Trades in sinnvoller Reihenfolge verarbeiten:
-    # 1) alle Buys, 2) alle Sells, jeweils chronologisch nach Datum
-    def date_key(date_str: str):
-        try:
-            d, m, y = map(int, date_str.split("."))
-            return (y, m, d)
-        except Exception:
-            return (9999, 12, 31)
-
-    trades = list(trades_by_key.values())
-    trades.sort(key=lambda t: (0 if t['Trade Type'] == 'Buy' else 1, date_key(t['Date'])))
-
-    for t in trades:
-        try:
-            update_excel(t)
-        except Exception as e:
-            print(f"Error while updating Excel for trade from file {t.get('_filename')}: {e}")
-            print("Trade data that failed:", t)
-
+    final_list.sort(key=sort_algo)
+    
+    if final_list:
+        write_excel(final_list)
+    else:
+        print("Keine verarbeitbaren Trades gefunden.")
 
 if __name__ == "__main__":
     process_pdfs()
