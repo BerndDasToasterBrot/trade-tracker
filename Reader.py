@@ -282,6 +282,54 @@ def apply_date_format_to_column(sheet, column_letter):
         if isinstance(sheet[f'{column_letter}{row}'].value, datetime):
             sheet[f'{column_letter}{row}'].style = date_style
 
+def choose_buy_row_interactively(sheet, source):
+    """
+    Zeigt offene bzw. relevante Buys an und lässt dich per a-z einen auswählen.
+    source == 'cost_info': nur Zeilen ohne Sell-Datum (F leer)
+    source == 'contract_note': alle Trades (auch schon geschlossene), damit du z.B. nur Steuern nachtragen kannst.
+    """
+    candidates = []
+    for row in range(2, sheet.max_row + 1):
+        name = sheet[f'A{row}'].value
+        if not name:
+            continue
+
+        # Für Cost-Info nur offene Buys anzeigen
+        if source == 'cost_info' and sheet[f'F{row}'].value:
+            continue
+
+        candidates.append(row)
+
+    if not candidates:
+        print("Keine passenden Buy-Kandidaten gefunden, es gibt keine offenen/geeigneten Buys.")
+        return None
+
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    max_entries = min(len(candidates), len(letters))
+
+    print("\nKein automatisches Match gefunden. Wähle den passenden Buy-Eintrag:")
+    for idx in range(max_entries):
+        row = candidates[idx]
+        letter = letters[idx]
+        name = sheet[f'A{row}'].value
+        buy_date = sheet[f'B{row}'].value
+        qty = sheet[f'C{row}'].value
+        print(f"  {letter}) Zeile {row}: {name} | Kaufdatum: {buy_date} | Menge: {qty}")
+
+    if len(candidates) > max_entries:
+        print(f"  ... ({len(candidates) - max_entries} weitere nicht angezeigt)")
+
+    print("  (Enter leer lassen, um keinen Match auszuwählen)")
+
+    while True:
+        choice = input("Deine Auswahl (a-z oder leer für keinen Match): ").strip().lower()
+        if choice == '':
+            return None
+        if len(choice) == 1 and choice in letters[:max_entries]:
+            idx = letters.index(choice)
+            return candidates[idx]
+        print("Ungültige Eingabe, bitte a-z oder Enter.")
+
 
 def update_excel(trade_data):
     # Read the existing Excel file or create a new DataFrame
@@ -290,6 +338,7 @@ def update_excel(trade_data):
         sheet = workbook.active
     else:
         print("Excel not found")
+        return False  # ohne Excel kein Erfolg
 
     trade_type = trade_data['Trade Type']
     asset_name = trade_data['Asset Name']
@@ -309,32 +358,36 @@ def update_excel(trade_data):
         sheet[f'A{next_row}'] = trade_data['Asset Name']
         buy_date = trade_data['Date']
         if isinstance(buy_date, str):
-            buy_date = datetime.strptime(buy_date, "%d.%m.%Y").date()  # Convert string to date object
-        sheet[f'B{next_row}'] = buy_date  # Write as string to avoid datetime conversion
-        sheet[f'B{next_row}'].style = "date_style"  # Apply date format to the new row
+            buy_date = datetime.strptime(buy_date, "%d.%m.%Y").date()
+        sheet[f'B{next_row}'] = buy_date
+        sheet[f'B{next_row}'].style = "date_style"
         sheet[f'C{next_row}'] = trade_data['Quantity']
         sheet[f'D{next_row}'] = trade_data['Price per Unit']
-        #sheet[f'K{next_row}'] = trade_data['Fees']
+        # sheet[f'K{next_row}'] = trade_data['Fees']
 
     elif trade_type == 'Sell':
-        # Cost-Info-Sell: wir wollen eine Zeile ohne Sell-Datum finden
-        # Contract-Note-Sell: wir dürfen auch Trades mit bereits gesetztem Sell-Datum nehmen,
-        # um NUR die Steuern nachzutragen.
+        # Cost-Info-Sell: nur Zeilen ohne Sell-Datum
+        # Contract-Note-Sell: auch Trades mit gesetztem Sell-Datum (nur Steuern nachtragen)
         require_empty_sell_date = (source == 'cost_info')
 
         match_row = find_best_matching_row(
             sheet,
             asset_name,
             require_empty_sell_date=require_empty_sell_date,
-            min_score=0.5  # kannst du bei Bedarf hoch/runter drehen
+            min_score=0.5
         )
 
         if not match_row:
             print(f"No matching Buy entry found for asset {asset_name}.")
-            workbook.save(EXCEL_FILE)
-            return
+            # Interaktive Auswahl aller relevanten Buys
+            manual_row = choose_buy_row_interactively(sheet, source)
+            if manual_row is None:
+                print("Kein manueller Match ausgewählt. Trade wird NICHT importiert.")
+                workbook.save(EXCEL_FILE)
+                return False
+            match_row = manual_row
 
-        # Sell-Daten eintragen, aber bei Contract-Notes nur, wenn noch nichts da ist
+        # Sell-Daten eintragen, aber bei Contract-Notes nur überschreiben, wenn noch nichts da ist
         sell_date = trade_data.get('Date')
         if sell_date and (source == 'cost_info' or not sheet[f'F{match_row}'].value):
             if isinstance(sell_date, str):
@@ -349,7 +402,6 @@ def update_excel(trade_data):
             sheet[f'H{match_row}'] = trade_data['Price per Unit']
 
         # --- Steuern aus Contract Notes ---
-
         if 'Capital Gains Tax' in trade_data:
             sheet[f'Y{match_row}'] = trade_data['Capital Gains Tax']
 
@@ -359,14 +411,12 @@ def update_excel(trade_data):
         if 'Church Tax' in trade_data:
             sheet[f'AA{match_row}'] = trade_data['Church Tax']
 
-        # Falls du Order Fees aus Contract Notes irgendwann auch automatisch in J summieren willst:
-        # if 'Order Fee' in trade_data:
-        #     old_fee = sheet[f'J{match_row}'].value or 0
-        #     sheet[f'J{match_row}'] = old_fee + trade_data['Order Fee']
-            # Optionally, handle this case by logging or adding an error row
+        # Order Fees könntest du später hier einbauen
 
+    # Gemeinsames Save & Erfolgsmeldung
     workbook.save(EXCEL_FILE)
     print(f"Excel file updated successfully with trade data for {trade_data['Asset Name']}.")
+    return True
 
 def process_pdfs():
     for filename in os.listdir(PDF_FOLDER):
@@ -388,11 +438,15 @@ def process_pdfs():
             trade_data = extract_contract_note_trade(pdf_text)
 
         if trade_data:
-            update_excel(trade_data)
-            os.remove(pdf_path)
-            print(f"{filename} processed and deleted.")
+            success = update_excel(trade_data)
+            if success:
+                os.remove(pdf_path)
+                print(f"{filename} processed and deleted.")
+            else:
+                print(f"{filename} wurde NICHT gelöscht, weil der Trade nicht importiert wurde.")
         else:
             print(f"Failed to extract data from {filename}.")
+
 
 if __name__ == "__main__":
     process_pdfs()
