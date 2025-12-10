@@ -194,17 +194,42 @@ def extract_contract_note_trade(pdf_text):
             if not lines:
                 print("Baader asset block empty.")
                 return None
-            asset_name = lines[-1]
+
+            # offensichtlichen Müll rausfiltern: Price/EUR/reine Zahlen
+            cleaned = []
+            for ln in lines:
+                lower = ln.lower()
+                if lower in ("price", "eur"):
+                    continue
+                if re.fullmatch(r'[\d\.,]+', ln):
+                    continue
+                cleaned.append(ln)
+            if cleaned:
+                lines = cleaned
+
+            # 1) Derivate: Zeile mit "Put" oder "Call" bevorzugen
+            deriv_lines = [ln for ln in lines if re.search(r'\b(put|call)\b', ln, re.I)]
+            if deriv_lines:
+                asset_name = deriv_lines[-1]
+            else:
+                # 2) Aktien / sonstiges: meist ist die erste Zeile der eigentliche Name
+                asset_name = lines[0]
+
             trade_data['Asset Name'] = asset_name
             print(f"[DEBUG] Baader Asset Name: {asset_name}")
         else:
             print("Asset name not found in Baader contract note (block regex).")
             return None
 
-        # (optional) Menge aus "Quantity\n\nUnits   26"
+        # (optional) Menge aus "Quantity\n\nUnits   22"
         qty_match = re.search(r'Quantity\s*\n\s*Units\s+([\d\.,]+)', pdf_text)
         if qty_match:
             trade_data['Quantity'] = parse_number(qty_match.group(1))
+
+        # Preis pro Stück aus dem "Price / EUR / 4.672" Block
+        price_match = re.search(r'Price\s*EUR\s*([\d\.,]+)', pdf_text)
+        if price_match:
+            trade_data['Price per Unit'] = parse_number(price_match.group(1))
 
         # Datum: erstes ISO-Datum direkt nach "Transaction Statement: ..."
         date_match = re.search(
@@ -226,7 +251,7 @@ def extract_contract_note_trade(pdf_text):
             section_text = section_match.group(1)
             minus_vals = re.findall(r'([\d\.,]+)\s*-\s*', section_text)
             if len(minus_vals) >= 3:
-                # letzte 3 negativen Werte: 1.84 -, 0.16 -, 0.10 -
+                # letzte 3 negativen Werte = Steuern
                 cg = parse_number(minus_vals[-3])
                 church = parse_number(minus_vals[-2])
                 soli = parse_number(minus_vals[-1])
@@ -236,10 +261,6 @@ def extract_contract_note_trade(pdf_text):
                 trade_data['Taxes Sum'] = cg + church + soli
 
         return trade_data
-
-    # nichts erkannt
-    return None
-
 
 def find_next_empty_row_in_column(sheet, column_letter):
     """Find the next empty row in the specified column that has actual data."""
@@ -328,8 +349,6 @@ def update_excel(trade_data):
             sheet[f'H{match_row}'] = trade_data['Price per Unit']
 
         # --- Steuern aus Contract Notes ---
-        if 'Taxes Sum' in trade_data:
-            sheet[f'T{match_row}'] = trade_data['Taxes Sum']
 
         if 'Capital Gains Tax' in trade_data:
             sheet[f'Y{match_row}'] = trade_data['Capital Gains Tax']
